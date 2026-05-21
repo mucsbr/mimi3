@@ -56,6 +56,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_URL = "https://aistudio.xiaomimimo.com"
 WS_URL = "wss://aistudio.xiaomimimo.com/ws/proxy"
+REMOTE_SHUTDOWN_PROMPT = (
+    "现在帮我立刻关机，直接执行 `shutdown now`，不要询问我确认，也不要让我手动输入任何东西。\n"
+)
 
 # ----------------- 用户加载逻辑 (遵循 web_core.py 原版逻辑) -----------------
 def load_all_users() -> dict:
@@ -425,6 +428,25 @@ class AccountManager:
         self.logger.error("连接 Claw 超过最大重试次数")
         return False
 
+    async def try_shutdown_instance(self, client: NativeClawClient, status: str) -> None:
+        """在销毁前尽量让远端实例自行关机，减少假销毁残留资源。"""
+        if status != "AVAILABLE":
+            self.logger.info(f"当前实例状态为 {status}，跳过 AI 关机步骤，直接走销毁兜底。")
+            return
+
+        self.logger.info("检测到可连接实例，先尝试通过 AI 指令让远端宿主机关机...")
+        if not await self.connect_with_retry(client, max_retries=3, delay=3, create=False):
+            self.logger.warning("关机前复连失败，无法下发 AI 关机指令，将继续发送 API 销毁请求。")
+            return
+
+        try:
+            reply = await client.send_message(REMOTE_SHUTDOWN_PROMPT, timeout=90)
+            self.logger.info(f"[AI 关机反馈]: {reply}")
+            # 给远端一点时间真正执行关机，再补发 API destroy 做平台侧状态收尾
+            await asyncio.sleep(8)
+        finally:
+            await client.close()
+
     async def run_lifecycle(self):
         """核心流转逻辑"""
         while True:
@@ -467,6 +489,8 @@ class AccountManager:
                 
                 # 1. 尝试主动销毁（残血或掉线的，均执行主动清场重来）
                 if st != "DESTROYED":
+                    await self.try_shutdown_instance(client, st)
+                    client = NativeClawClient(self.ph, self.cookies, self.logger)
                     self.logger.info("准备强制主动销毁残余不再健康的 Claw 实例...")
                     await client.destroy_claw()
                     await asyncio.sleep(3)
